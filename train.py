@@ -20,8 +20,7 @@ from typing import List, Tuple, Dict, Any
 from memory_profiler import profile
 from torch.optim import AdamW
 import wandb
-
-
+import lpips
 
 def load_config(config_path):
     with open(config_path, 'r') as file:
@@ -133,7 +132,7 @@ def sample_recon(model, data, accelerator, output_path, num_samples=8):
 def train(config, model, train_dataloader, accelerator, ema_decay=0.999, style_mixing_prob=0.9, r1_gamma=10):
     debug_print("Config:", config)
     debug_print("Training config:", config.get('training', {}))
-
+  
     learning_rate = config.get('training', {}).get('learning_rate', None)
     if learning_rate is None:
         raise ValueError("Learning rate not found in config")
@@ -153,6 +152,7 @@ def train(config, model, train_dataloader, accelerator, ema_decay=0.999, style_m
     ema_model.load_state_dict(accelerator.unwrap_model(model).state_dict())
 
     mse_loss = nn.MSELoss()
+    lpips_loss = lpips.LPIPS(net='alex').to(accelerator.device)
 
     # Create checkpoint directory if it doesn't exist
     os.makedirs(config['checkpoints']['dir'], exist_ok=True)
@@ -172,6 +172,8 @@ def train(config, model, train_dataloader, accelerator, ema_decay=0.999, style_m
 
     for epoch in range(start_epoch, config['training']['num_epochs']):
         model.train()
+        total_mse_loss = 0
+        total_perceptual_loss = 0
         total_loss = 0
         progress_bar = tqdm(total=len(train_dataloader), desc=f"Epoch {epoch+1}/{config['training']['num_epochs']}", 
                             disable=not accelerator.is_local_main_process)
@@ -225,7 +227,10 @@ def train(config, model, train_dataloader, accelerator, ema_decay=0.999, style_m
             with torch.set_grad_enabled(True):
                 reconstructed_frames = model.frame_decoder(aligned_features)
                 debug_print(f"Final reconstructed frames shape: {reconstructed_frames.shape}")
-                loss = mse_loss(reconstructed_frames, current_frames)
+                mse = mse_loss(reconstructed_frames, current_frames)
+                perceptual = lpips_loss(reconstructed_frames, current_frames).mean()
+                loss = mse + 0.1 * perceptual
+
                 if torch.isnan(loss):
                     print("NaN loss detected. Skipping this batch.")
                     optimizer.zero_grad()
@@ -261,7 +266,7 @@ def train(config, model, train_dataloader, accelerator, ema_decay=0.999, style_m
                     reference_frames.requires_grad_(False)
             accelerator.backward(loss)
              # Monitor gradients before optimizer step
-            monitor_gradients(model, epoch, batch_idx)
+            # monitor_gradients(model, epoch, batch_idx)
             #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
 
@@ -273,6 +278,8 @@ def train(config, model, train_dataloader, accelerator, ema_decay=0.999, style_m
                 for p_ema, p in zip(ema_model.parameters(), accelerator.unwrap_model(model).parameters()):
                     p_ema.copy_(p.lerp(p_ema, ema_decay))
 
+            total_mse_loss += mse.item()
+            total_perceptual_loss += perceptual.item()
             total_loss += loss.item()
             
             # Update progress bar
@@ -280,16 +287,27 @@ def train(config, model, train_dataloader, accelerator, ema_decay=0.999, style_m
             progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
             # Log batch loss to wandb
-            wandb.log({"batch_loss": loss.item(), "batch": batch_idx + epoch * len(train_dataloader)})
+            wandb.log({
+                "batch_mse_loss": mse.item(),
+                "batch_perceptual_loss": perceptual.item(),
+                "batch_total_loss": loss.item(),
+                "batch": batch_idx + epoch * len(train_dataloader)
+            })
 
         progress_bar.close()
+        avg_mse_loss = total_mse_loss / len(train_dataloader)
+        avg_perceptual_loss = total_perceptual_loss / len(train_dataloader)
         avg_loss = total_loss / len(train_dataloader)
-        accelerator.print(f"Epoch [{epoch+1}/{config['training']['num_epochs']}], Average Loss: {avg_loss:.4f}")
-
+        accelerator.print(f"Epoch [{epoch+1}/{config['training']['num_epochs']}], "
+                          f"MSE: {avg_mse_loss:.4f}, "
+                          f"lpips: {avg_perceptual_loss:.4f}, "
+                          f"avg: {avg_loss:.4f}")
         # Log epoch metrics to wandb
         wandb.log({
             "epoch": epoch + 1,
-            "avg_loss": avg_loss,
+            "avg_mse_loss": avg_mse_loss,
+            "avg_perceptual_loss": avg_perceptual_loss,
+            "avg_total_loss": avg_loss,
         })
 
         # Save checkpoint
@@ -320,9 +338,11 @@ def train(config, model, train_dataloader, accelerator, ema_decay=0.999, style_m
 def hook_fn(name):
     def hook(grad):
         if torch.isnan(grad).any():
-            print(f"🔥 NaN gradient detected in {name}")
+            # print(f"🔥 NaN gradient detected in {name}")
+            return torch.zeros_like(grad)  # Replace NaN with zero
         elif torch.isinf(grad).any():
-            print(f"🔥 Inf gradient detected in {name}")
+            # print(f"🔥 Inf gradient detected in {name}")
+            return torch.clamp(grad, -1e6, 1e6)  # Clamp infinite values
         #else:
             # You can add more conditions or logging here
          #  grad_norm = grad.norm().item()
