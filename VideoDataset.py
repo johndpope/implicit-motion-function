@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import IterableDataset
 from decord import VideoReader, cpu
 import torchvision.transforms as transforms
+import random
 import os
 
 class VideoDataset(Dataset):
@@ -18,37 +19,34 @@ class VideoDataset(Dataset):
         self.video_files = [os.path.join(subdir, file)
                             for subdir, dirs, files in os.walk(root_dir)
                             for file in files if file.endswith('.mp4')]
-        # self.total_frames = self._count_total_frames()
         decord.bridge.set_bridge('torch')  # Optional: This line sets decord to directly output PyTorch tensors.
         self.ctx = decord.cpu()
 
-    def _count_total_frames(self):
-        total = 0
-        for video_path in self.video_files:
-            vr = VideoReader(video_path, ctx=cpu(0))
-            total += max(0, len(vr) - self.frame_skip)
-        return total
-    
     def __len__(self):
-        return 1000 #self.total_frames
-        
+        return 1000  # You can adjust this value based on how many samples you want per epoch
+
     def augmentation(self, images, transform, state=None):
         if state is not None:
             torch.set_rng_state(state)
-        if isinstance(images, List):
+        if isinstance(images, list):
             transformed_images = [transform(img) for img in images]
             ret_tensor = torch.stack(transformed_images, dim=0)  # (f, c, h, w)
         else:
             ret_tensor = transform(images)  # (c, h, w)
         return ret_tensor
-        
+
     def __getitem__(self, idx):
-        video_idx, frame_idx = self._get_video_and_frame(idx)
-        video_path = self.video_files[video_idx]
+        video_path = random.choice(self.video_files)
         vr = VideoReader(video_path, ctx=self.ctx)
         
-        current_frame_idx = frame_idx
-        reference_frame_idx = frame_idx + self.frame_skip
+        # Ensure we can get both current and reference frames
+        max_frame_idx = len(vr) - self.frame_skip - 1
+        if max_frame_idx < 0:
+            # If the video is too short, choose another one
+            return self.__getitem__(idx)
+        
+        current_frame_idx = random.randint(0, max_frame_idx)
+        reference_frame_idx = current_frame_idx + self.frame_skip
         
         current_frame = Image.fromarray(vr[current_frame_idx].numpy())  
         reference_frame = Image.fromarray(vr[reference_frame_idx].numpy())  
@@ -58,7 +56,6 @@ class VideoDataset(Dataset):
             current_frame = self.augmentation(current_frame, self.transform, state)
             reference_frame = self.augmentation(reference_frame, self.transform, state)
 
-        
         return current_frame, reference_frame
     
     def _get_video_and_frame(self, idx):
