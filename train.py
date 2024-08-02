@@ -29,7 +29,7 @@ def load_config(config_path):
 import numpy as np
 from collections import defaultdict
 
-
+from EMODataset import EMODataset,gpu_padded_collate
 
 @profile
 def train(config, model, train_dataloader, accelerator, ema_decay=0.999, style_mixing_prob=0.9, r1_gamma=10):
@@ -81,121 +81,131 @@ def train(config, model, train_dataloader, accelerator, ema_decay=0.999, style_m
         progress_bar = tqdm(total=len(train_dataloader), desc=f"Epoch {epoch+1}/{config['training']['num_epochs']}", 
                             disable=not accelerator.is_local_main_process)
         
-        for batch_idx, (current_frames, reference_frames) in enumerate(train_dataloader):
-            debug_print(f"Batch {batch_idx} input shapes - current_frames: {current_frames.shape}, reference_frames: {reference_frames.shape}")
+        for batch_idx, batch in enumerate(train_dataloader):
+                    source_frames = batch['frames']
+                    batch_size, num_frames, channels, height, width = source_frames.shape
 
-            # Forward pass
-            reconstructed_frames = model(current_frames, reference_frames)
-            debug_print(f"Reconstructed frames shape: {reconstructed_frames.shape}")
+                    for ref_idx in range(0, num_frames, config['training']['every_xref_frames'] ):  # Step by 16 for reference frames
 
-            # Add noise to latent tokens for improved training dynamics
-            tc = model.latent_token_encoder(current_frames)
-            tr = model.latent_token_encoder(reference_frames)
-            debug_print(f"Latent token shapes - tc: {tc.shape}, tr: {tr.shape}")
+                        x_reference = source_frames[:, ref_idx]
 
-            noise_magnitude = 0.1
-            noise = torch.randn_like(tc) * noise_magnitude
-            tc = tc + noise
-            tr = tr + noise
+                        for current_idx in range(num_frames):
+                            if current_idx == ref_idx:
+                                continue  # Skip when current frame is the reference frame
+                            x_current = source_frames[:, current_idx]
 
-            # Perform style mixing regularization
-            if torch.rand(()).item() < style_mixing_prob:
-                rand_tc = tc[torch.randperm(tc.size(0))]
-                rand_tr = tr[torch.randperm(tr.size(0))]
+                            # Forward pass
+                            reconstructed_frames = model(x_current, x_reference)
+                            debug_print(f"Reconstructed frames shape: {reconstructed_frames.shape}")
 
-                mix_tc = [rand_tc if torch.rand(()).item() < 0.5 else tc for _ in range(len(model.imf.implicit_motion_alignment))]
-                mix_tr = [rand_tr if torch.rand(()).item() < 0.5 else tr for _ in range(len(model.imf.implicit_motion_alignment))]
-            else:
-                mix_tc = [tc] * len(model.imf.implicit_motion_alignment)
-                mix_tr = [tr] * len(model.imf.implicit_motion_alignment)
+                            # Add noise to latent tokens for improved training dynamics
+                            tc = model.latent_token_encoder(x_current)
+                            tr = model.latent_token_encoder(x_reference)
+                            debug_print(f"Latent token shapes - tc: {tc.shape}, tr: {tr.shape}")
 
-            debug_print(f"Mixed token shapes - mix_tc: {[t.shape for t in mix_tc]}, mix_tr: {[t.shape for t in mix_tr]}")
+                            noise_magnitude = 0.1
+                            noise = torch.randn_like(tc) * noise_magnitude
+                            tc = tc + noise
+                            tr = tr + noise
 
-            m_c, m_r = model.imf.process_tokens(mix_tc, mix_tr)
+                            # Perform style mixing regularization
+                            if torch.rand(()).item() < style_mixing_prob:
+                                rand_tc = tc[torch.randperm(tc.size(0))]
+                                rand_tr = tr[torch.randperm(tr.size(0))]
 
-            fr = model.imf.dense_feature_encoder(reference_frames)
-            debug_print(f"Dense feature encoder output shapes: {[f.shape for f in fr]}")
+                                mix_tc = [rand_tc if torch.rand(()).item() < 0.5 else tc for _ in range(len(model.imf.implicit_motion_alignment))]
+                                mix_tr = [rand_tr if torch.rand(()).item() < 0.5 else tr for _ in range(len(model.imf.implicit_motion_alignment))]
+                            else:
+                                mix_tc = [tc] * len(model.imf.implicit_motion_alignment)
+                                mix_tr = [tr] * len(model.imf.implicit_motion_alignment)
 
-            aligned_features = []
-            for i in range(len(model.imf.implicit_motion_alignment)):
-                f_r_i = fr[i]
-                align_layer = model.imf.implicit_motion_alignment[i]
-                m_c_i = m_c[i][i]  # Access the i-th element of the i-th sublist
-                m_r_i = m_r[i][i]  # Access the i-th element of the i-th sublist
-                debug_print(f"Layer {i} input shapes - f_r_i: {f_r_i.shape}, m_c_i: {m_c_i.shape}, m_r_i: {m_r_i.shape}")
-                aligned_feature = align_layer(m_c_i, m_r_i, f_r_i)
-                debug_print(f"Layer {i} aligned feature shape: {aligned_feature.shape}")
-                aligned_features.append(aligned_feature)
+                            debug_print(f"Mixed token shapes - mix_tc: {[t.shape for t in mix_tc]}, mix_tr: {[t.shape for t in mix_tr]}")
 
-            with torch.set_grad_enabled(True):
-                reconstructed_frames = model.frame_decoder(aligned_features)
-                debug_print(f"Final reconstructed frames shape: {reconstructed_frames.shape}")
-                mse = mse_loss(reconstructed_frames, current_frames)
-                perceptual = lpips_loss(reconstructed_frames, current_frames).mean()
-                loss = mse + 0.4 * perceptual
+                            m_c, m_r = model.imf.process_tokens(mix_tc, mix_tr)
 
-                if torch.isnan(loss):
-                    print("NaN loss detected. Skipping this batch.")
-                    optimizer.zero_grad()
-                    continue
-                 # R1 regularization for better training stability  
-                if batch_idx % 16 == 0:
-                    current_frames.requires_grad_(True)
-                    reference_frames.requires_grad_(True)
-                    
-                    with torch.enable_grad():
-                        reconstructed_frames = model(current_frames, reference_frames)
-                        debug_print(f"Reconstructed frames shape before R1: {reconstructed_frames.shape}")
-                        debug_print(f"Current frames shape before R1: {current_frames.shape}")
-                        
-                        r1_loss = torch.autograd.grad(
-                            outputs=reconstructed_frames.sum(), 
-                            inputs=[current_frames, reference_frames], 
-                            create_graph=True, 
-                            allow_unused=True
-                        )
-                        
-                        if r1_loss[0] is not None and r1_loss[1] is not None:
-                            r1_loss_current = r1_loss[0].pow(2).reshape(r1_loss[0].shape[0], -1).sum(1).mean()
-                            r1_loss_reference = r1_loss[1].pow(2).reshape(r1_loss[1].shape[0], -1).sum(1).mean()
-                            r1_loss_total = r1_loss_current + r1_loss_reference
-                            debug_print(f"r1_loss_current shape: {r1_loss_current.shape}")
-                            debug_print(f"r1_loss_reference shape: {r1_loss_reference.shape}")
-                            loss = loss + r1_gamma * 0.5 * r1_loss_total * 16
-                        else:
-                            debug_print("Warning: r1_loss is None. Skipping R1 regularization for this batch.")
+                            fr = model.imf.dense_feature_encoder(x_reference)
+                            debug_print(f"Dense feature encoder output shapes: {[f.shape for f in fr]}")
 
-                    current_frames.requires_grad_(False)
-                    reference_frames.requires_grad_(False)
-            accelerator.backward(loss)
-             # Monitor gradients before optimizer step
-            # monitor_gradients(model, epoch, batch_idx)
-            #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                            aligned_features = []
+                            for i in range(len(model.imf.implicit_motion_alignment)):
+                                f_r_i = fr[i]
+                                align_layer = model.imf.implicit_motion_alignment[i]
+                                m_c_i = m_c[i][i]  # Access the i-th element of the i-th sublist
+                                m_r_i = m_r[i][i]  # Access the i-th element of the i-th sublist
+                                debug_print(f"Layer {i} input shapes - f_r_i: {f_r_i.shape}, m_c_i: {m_c_i.shape}, m_r_i: {m_r_i.shape}")
+                                aligned_feature = align_layer(m_c_i, m_r_i, f_r_i)
+                                debug_print(f"Layer {i} aligned feature shape: {aligned_feature.shape}")
+                                aligned_features.append(aligned_feature)
+
+                            with torch.set_grad_enabled(True):
+                                reconstructed_frames = model.frame_decoder(aligned_features)
+                                debug_print(f"Final reconstructed frames shape: {reconstructed_frames.shape}")
+                                mse = mse_loss(reconstructed_frames, x_current)
+                                perceptual = lpips_loss(reconstructed_frames, x_current).mean()
+                                loss = mse + 0.4 * perceptual
+
+                                if torch.isnan(loss):
+                                    print("NaN loss detected. Skipping this batch.")
+                                    optimizer.zero_grad()
+                                    continue
+                                # R1 regularization for better training stability  
+                                if batch_idx % 16 == 0:
+                                    x_current.requires_grad_(True)
+                                    x_reference.requires_grad_(True)
+                                    
+                                    with torch.enable_grad():
+                                        reconstructed_frames = model(x_current, x_reference)
+                                        debug_print(f"Reconstructed frames shape before R1: {reconstructed_frames.shape}")
+                                        debug_print(f"Current frames shape before R1: {x_current.shape}")
+                                        
+                                        r1_loss = torch.autograd.grad(
+                                            outputs=reconstructed_frames.sum(), 
+                                            inputs=[x_current, x_reference], 
+                                            create_graph=True, 
+                                            allow_unused=True
+                                        )
+                                        
+                                        if r1_loss[0] is not None and r1_loss[1] is not None:
+                                            r1_loss_current = r1_loss[0].pow(2).reshape(r1_loss[0].shape[0], -1).sum(1).mean()
+                                            r1_loss_reference = r1_loss[1].pow(2).reshape(r1_loss[1].shape[0], -1).sum(1).mean()
+                                            r1_loss_total = r1_loss_current + r1_loss_reference
+                                            debug_print(f"r1_loss_current shape: {r1_loss_current.shape}")
+                                            debug_print(f"r1_loss_reference shape: {r1_loss_reference.shape}")
+                                            loss = loss + r1_gamma * 0.5 * r1_loss_total * 16
+                                        else:
+                                            debug_print("Warning: r1_loss is None. Skipping R1 regularization for this batch.")
+
+                                    x_current.requires_grad_(False)
+                                    x_reference.requires_grad_(False)
+                            accelerator.backward(loss)
+                            # Monitor gradients before optimizer step
+                            # monitor_gradients(model, epoch, batch_idx)
+                            #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
 
-            optimizer.step()
-            optimizer.zero_grad()
+                            optimizer.step()
+                            optimizer.zero_grad()
 
-            # Update exponential moving average of weights
-            with torch.no_grad():
-                for p_ema, p in zip(ema_model.parameters(), accelerator.unwrap_model(model).parameters()):
-                    p_ema.copy_(p.lerp(p_ema, ema_decay))
+                            # Update exponential moving average of weights
+                            with torch.no_grad():
+                                for p_ema, p in zip(ema_model.parameters(), accelerator.unwrap_model(model).parameters()):
+                                    p_ema.copy_(p.lerp(p_ema, ema_decay))
 
-            total_mse_loss += mse.item()
-            total_perceptual_loss += perceptual.item()
-            total_loss += loss.item()
-            
-            # Update progress bar
-            progress_bar.update(1)
-            progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
+                            total_mse_loss += mse.item()
+                            total_perceptual_loss += perceptual.item()
+                            total_loss += loss.item()
+                            
+                            # Update progress bar
+                            progress_bar.update(1)
+                            progress_bar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
-            # Log batch loss to wandb
-            wandb.log({
-                "batch_mse_loss": mse.item(),
-                "batch_perceptual_loss": perceptual.item(),
-                "batch_total_loss": loss.item(),
-                "batch": batch_idx + epoch * len(train_dataloader)
-            })
+                            # Log batch loss to wandb
+                            wandb.log({
+                                "batch_mse_loss": mse.item(),
+                                "batch_perceptual_loss": perceptual.item(),
+                                "batch_total_loss": loss.item(),
+                                "batch": batch_idx + epoch * len(train_dataloader)
+                        })
 
         progress_bar.close()
         avg_mse_loss = total_mse_loss / len(train_dataloader)
@@ -290,15 +300,32 @@ def main():
     ])
 
     debug_print("Loading VideoDataset...")
-    dataset = VideoDataset(
-        root_dir=config['dataset']['root_dir'],
+    # dataset = VideoDataset(
+    #     root_dir=config['dataset']['root_dir'],
+    #     transform=transform,
+    #     frame_skip=config['dataset']['frame_skip']
+    # )
+
+    dataset = EMODataset(
+        use_gpu=True,
+        remove_background=False,
+        width=256,
+        height=256,
+        sample_rate=24,
+        img_scale=(1.0, 1.0),
+        video_dir=config['dataset']['root_dir'],
+        json_file=config['dataset']['json_file'],
         transform=transform,
-        frame_skip=config['dataset']['frame_skip']
+        apply_crop_warping=False
     )
+
+
+
     dataloader = DataLoader(
         dataset,
         batch_size=config['training']['batch_size'],
-        num_workers=4
+        num_workers=1,
+        collate_fn=gpu_padded_collate 
     )
 
     debug_print("Training...")

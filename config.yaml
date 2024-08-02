@@ -6,6 +6,7 @@ model:
 
 # Training parameters
 training:
+  every_xref_frames: 16
   batch_size: 4
   num_epochs: 100
   learning_rate: 1.0e-4
@@ -17,6 +18,7 @@ training:
 dataset:
   root_dir: "/media/oem/12TB/Downloads/CelebV-HQ/celebvhq/35666"
   frame_skip: 1
+  json_file: './data/celebvhq_info.json' 
 
 # Checkpointing
 checkpoints:
