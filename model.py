@@ -9,7 +9,7 @@ import os
 import torchvision.models as models
 from memory_profiler import profile
 import colored_traceback.auto
-
+# from vit import ImplicitMotionAlignment
 
 DEBUG = False
 def debug_print(*args, **kwargs):
@@ -137,18 +137,19 @@ class StyleConv2d(nn.Module):
 
 
 
-class ImplicitMotionAlignment(nn.Module):
-    def __init__(self, feature_dim, motion_dim, num_heads=8):
+class ImplicitMotionAlignmentBROKEN(nn.Module):
+
+    def __init__(self, feature_dim, motion_dim,layer_name, depth=2, heads=8, dim_head=64, mlp_dim=1024):
         super().__init__()
         self.feature_dim = feature_dim 
         self.motion_dim = motion_dim 
-        self.num_heads = num_heads
+        self.num_heads = heads
 
         self.q_proj = nn.Linear(motion_dim, feature_dim)
         self.k_proj = nn.Linear(motion_dim, feature_dim)
         self.v_proj = nn.Linear(feature_dim, feature_dim)
 
-        self.cross_attention = nn.MultiheadAttention(feature_dim, num_heads)
+        self.cross_attention = nn.MultiheadAttention(feature_dim, heads)
         self.norm1 = nn.LayerNorm(feature_dim)
         self.norm2 = nn.LayerNorm(feature_dim)
         self.ffn = nn.Sequential(
@@ -156,11 +157,11 @@ class ImplicitMotionAlignment(nn.Module):
             nn.ReLU(),
             nn.Linear(feature_dim * 4, feature_dim)
         )
-
+        self.layer_name = layer_name
         debug_print(f"ImplicitMotionAlignment initialized: feature_dim={feature_dim}, motion_dim={motion_dim}")
 
     def forward(self, q, k, v):
-        debug_print(f"ImplicitMotionAlignment input shapes - q: {q.shape}, k: {k.shape}, v: {v.shape}")
+        debug_print(f"🌏 ImplicitMotionAlignment input shapes -layer_name:{self.layer_name} q: {q.shape}, k: {k.shape}, v: {v.shape}")
         
         batch_size, c, h, w = v.shape
 
@@ -213,15 +214,18 @@ class IMF(nn.Module):
         self.latent_token_encoder = LatentTokenEncoder(latent_dim=latent_dim)
         self.latent_token_decoder = LatentTokenDecoder(latent_dim=latent_dim, base_channels=base_channels, num_layers=num_layers)
         
-        # Adjust feature_dims for ResNet50 output
-        self.feature_dims = [64, 256, 512, 1024]
-        self.motion_dims = [base_channels // (2 ** i) for i in range(num_layers)]
+        # Adjust feature_dims and motion_dims to match desired sizes
+        self.feature_dims = [128, 256, 512, 1024]
+        self.motion_dims = [256, 512, 512, 512]
+        self.spatial_dims = [(64, 64), (32, 32), (16, 16), (8, 8)]
         
         self.implicit_motion_alignment = nn.ModuleList()
         for i in range(num_layers):
             feature_dim = self.feature_dims[i]
             motion_dim = self.motion_dims[i]
-            alignment_module = ImplicitMotionAlignment(feature_dim=feature_dim, motion_dim=motion_dim)
+            spatial_dim = self.spatial_dims[i]
+            alignment_module = ImplicitMotionAlignmentBROKEN(feature_dim=feature_dim, motion_dim=motion_dim,layer_name=i)
+            # alignment_module = ImplicitMotionAlignment(feature_dim=feature_dim, motion_dim=motion_dim,spatial_dim=spatial_dim, layer_name=i)
             self.implicit_motion_alignment.append(alignment_module)
 
     def forward(self, x_current, x_reference):
@@ -241,18 +245,22 @@ class IMF(nn.Module):
         aligned_features = []
         for i, (f_r_i, m_r_i, m_c_i, align_layer) in enumerate(zip(f_r, m_r, m_c, self.implicit_motion_alignment)):
             debug_print(f"Layer {i} input shapes - f_r_i: {f_r_i.shape}, m_r_i: {m_r_i.shape}, m_c_i: {m_c_i.shape}")
+            
+            # Adjust feature dimensions
+            f_r_i = F.interpolate(f_r_i, size=self.spatial_dims[i], mode='bilinear', align_corners=False)
+            f_r_i = f_r_i[:, :self.feature_dims[i], :, :]
+            
+            # Adjust motion dimensions
+            m_r_i = F.interpolate(m_r_i, size=self.spatial_dims[i], mode='bilinear', align_corners=False)
+            m_r_i = torch.cat([m_r_i] * (self.motion_dims[i] // m_r_i.shape[1]), dim=1)
+            m_c_i = F.interpolate(m_c_i, size=self.spatial_dims[i], mode='bilinear', align_corners=False)
+            m_c_i = torch.cat([m_c_i] * (self.motion_dims[i] // m_c_i.shape[1]), dim=1)
+            
             aligned_feature = align_layer(m_c_i, m_r_i, f_r_i)
             debug_print(f"Layer {i} aligned feature shape: {aligned_feature.shape}")
             aligned_features.append(aligned_feature)
 
         return aligned_features
-
-    # def process_tokens(self, t_c, t_r):
-    #     debug_print(f"process_tokens input shapes - t_c: {[tc.shape for tc in t_c]}, t_r: {[tr.shape for tr in t_r]}")
-    #     m_c = [self.latent_token_decoder(tc) for tc in t_c]
-    #     m_r = [self.latent_token_decoder(tr) for tr in t_r]
-    #     debug_print(f"process_tokens output shapes - m_c: {[[mc_i.shape for mc_i in mc] for mc in m_c]}, m_r: {[[mr_i.shape for mr_i in mr] for mr in m_r]}")
-    #     return m_c, m_r
 
     def process_tokens(self, t_c, t_r):
         debug_print(f"process_tokens input types - t_c: {type(t_c)}, t_r: {type(t_r)}")
@@ -274,42 +282,7 @@ class IMF(nn.Module):
         return m_c, m_r
 
 
-class ResNetIMF(nn.Module):
-    def __init__(self, latent_dim=32):
-        super().__init__()
-        self.dense_feature_encoder = ResNetFeatureExtractor()
-        self.latent_token_encoder = LatentTokenEncoder(latent_dim=latent_dim)
-        self.latent_token_decoder = LatentTokenDecoder(latent_dim=latent_dim)
-        
-        # Adjust the implicit motion alignment for ResNet feature dimensions
-        feature_dims = [64, 256, 512, 1024]  # ResNet50 feature dimensions
-        self.implicit_motion_alignment = nn.ModuleList([
-            ImplicitMotionAlignment(dim) for dim in feature_dims
-        ])
 
-    def forward(self, x_current, x_reference):
-        # Encode reference frame
-        f_r = self.dense_feature_encoder(x_reference)
-        t_r = self.latent_token_encoder(x_reference)
-
-        # Encode current frame
-        t_c = self.latent_token_encoder(x_current)
-
-        # Decode motion features
-        m_r = self.latent_token_decoder(t_r)
-        m_c = self.latent_token_decoder(t_c)
-
-        # Align features
-        aligned_features = []
-        for i, (f_r_i, m_r_i, m_c_i, align_layer) in enumerate(zip(f_r, m_r, m_c, self.implicit_motion_alignment)):
-            q = m_c_i.flatten(2).permute(2, 0, 1)
-            k = m_r_i.flatten(2).permute(2, 0, 1)
-            v = f_r_i.flatten(2).permute(2, 0, 1)
-            aligned_feature = align_layer(q, k, v)
-            aligned_feature = aligned_feature.permute(1, 2, 0).view_as(f_r_i)
-            aligned_features.append(aligned_feature)
-
-        return aligned_features
 class FrameDecoder(nn.Module):
     def __init__(self, feature_dims=[64, 256, 512, 1024]):
         super().__init__()
@@ -328,7 +301,7 @@ class FrameDecoder(nn.Module):
         debug_print(f"FrameDecoder initialized with feature_dims: {feature_dims}")
 
     def forward(self, features):
-        debug_print(f"FrameDecoder input features: {[f.shape for f in features]}")
+        debug_print(f"🌻 FrameDecoder input features: {[f.shape for f in features]}")
         x = features[-1]
         debug_print(f"Starting x shape: {x.shape}")
         
