@@ -205,11 +205,11 @@ def train(config, model, train_dataloader, accelerator, ema_decay=0.999, style_m
                                 "batch_perceptual_loss": perceptual.item(),
                                 "batch_total_loss": loss.item(),
                                 "batch": batch_idx + epoch * len(train_dataloader)
-                        })
-                            # Sample and save reconstructions
-                    sample_path = f"recon_epoch_{epoch+1}_batch_{ref_idx}.png"
-                    sample_recon(model, (x_reconstructed, x_reference), accelerator, sample_path,  num_samples=config.logging.sample_size)
-   
+                            })
+                                # Sample and save reconstructions
+                        sample_path = f"recon_epoch_{epoch+1}_batch_{ref_idx}.png"
+                        sample_recon(model, (x_reconstructed, x_reference), accelerator, sample_path,  num_samples=config.logging.sample_size)
+    
 
         progress_bar.close()
         avg_mse_loss = total_mse_loss / len(train_dataloader)
