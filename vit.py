@@ -54,15 +54,34 @@ class TransformerBlock(nn.Module):
         return output
 
 class ImplicitMotionAlignment(nn.Module):
-    def __init__(self, feature_dim, motion_dim, depth=2, heads=8, dim_head=64, mlp_dim=1024):
+    def __init__(self, feature_dim, motion_dim,spatial_dim,layer_name, depth=2, heads=8, dim_head=64, mlp_dim=1024):
         super().__init__()
+        self.layer_name = layer_name 
         self.cross_attention = CrossAttentionModule(feature_dim, motion_dim, heads, dim_head)
         self.transformer_blocks = nn.ModuleList([
             TransformerBlock(feature_dim, heads, dim_head, mlp_dim) for _ in range(depth)
         ])
+        self.spatial_dim = spatial_dim
+        self.feature_dim = feature_dim
+        self.motion_dim = motion_dim
+        
+      
+        self.channel_upscale = nn.Conv2d(self.spatial_dim[0], self.feature_dim, kernel_size=1)  # 4x upscale in channel dimension
+
 
     def forward(self, ml_c, ml_r, fl_r):
         embeddings = []
+        # 4x upscale the channel dimension of fl_r
+        print(f"🌾 ImplicitMotionAlignment")
+        print(f"self.layer_name:{self.layer_name}")
+        print(f"self.spatial_dim:{self.spatial_dim}")
+        print(f"self.feature_dim:{self.feature_dim}")
+        print(f"self.motion_dim:{self.motion_dim}")
+        print(f" input shapes - layer_name:{self.layer_name} q: {ml_c.shape}, k: {ml_r.shape}, v: {fl_r.shape}  spatial_dim:{self.spatial_dim}") 
+        
+        if self.layer_name == 0:
+            fl_r = self.channel_upscale(fl_r)
+        print(f"-> input shapes - layer_name:{self.layer_name} q: {ml_c.shape}, k: {ml_r.shape}, v: {fl_r.shape}  spatial_dim:{self.spatial_dim}") 
         
         # Cross-attention module
         V_prime = self.cross_attention(ml_c, ml_r, fl_r)
